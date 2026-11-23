@@ -2,7 +2,11 @@
 
 听页是 Windows 桌面 EPUB 阅读和朗读软件。支持无 DRM 的 EPUB 2 和 EPUB 3，可按章节或段落朗读，并保存阅读进度。
 
-## 编译和使用
+## 下载 Windows 版
+
+从发布页下载 `Tingye-Windows-*.zip`，解压后双击 `Tingye.exe`。基础朗读使用 Windows 系统语音。 [下载最新版](https://github.com/darkknight2333/tingye/releases/latest)
+
+## 从源码编译和使用
 
 在装有 64 位 .NET Framework 4.x 的 Windows 上，从 PowerShell 进入仓库目录，运行 `./Build.ps1`，然后打开生成的 `Tingye.exe`。
 
