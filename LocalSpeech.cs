@@ -31,6 +31,7 @@ namespace Tingye
         private readonly string root, model, runtime, voices, ffmpeg;
         private readonly string qwenRuntime, qwenModel, qwenTokenizer;
         private readonly SemaphoreSlim synthesis = new SemaphoreSlim(1, 1);
+        private readonly Lazy<Task<bool>> smallGpu = new Lazy<Task<bool>>(() => Task.Run(new Func<bool>(HasSmallNvidiaGpu)));
         private readonly object processGate = new object();
         private readonly Timer idleTimer;
         private readonly HttpClient http = new HttpClient(new HttpClientHandler { UseProxy = false, AllowAutoRedirect = false })
@@ -86,13 +87,16 @@ namespace Tingye
             }
         }
 
-        public Task<byte[]> SynthesizeAsync(string text, string instructions, CancellationToken token)
+        public Task<byte[]> SynthesizeAsync(string text, string instructions, CancellationToken token,
+            float speed = 1f, int tailMs = 140, Func<byte[], Task> streamAudio = null)
         {
             var payload = new JavaScriptSerializer().Serialize(new {
                 input = text, voice = Speaker, instructions = instructions,
                 response_format = "pcm", cfg_scale = 1.0
             });
-            return RequestSpeechAsync(payload, false, token);
+            return RequestSpeechAsync(payload, false, token, streamAudio == null ? null :
+                (Func<Stream, CancellationToken, Task<byte[]>>)((body, cancel) =>
+                    ReadLiveAsync(body, speed, tailMs, streamAudio, cancel)));
         }
 
         public Task<byte[]> SynthesizeQwenAsync(string payload, CancellationToken token)
@@ -111,7 +115,8 @@ namespace Tingye
             }
         }
 
-        private async Task<byte[]> RequestSpeechAsync(string payload, bool useQwen, CancellationToken token)
+        private async Task<byte[]> RequestSpeechAsync(string payload, bool useQwen, CancellationToken token,
+            Func<Stream, CancellationToken, Task<byte[]>> streamReader = null)
         {
             await synthesis.WaitAsync(token).ConfigureAwait(false);
             try
@@ -128,7 +133,7 @@ namespace Tingye
                         using (var request = new HttpRequestMessage(HttpMethod.Post, speech))
                         {
                             request.Content = new StringContent(payload, Encoding.UTF8, "application/json");
-                            return await BreezeVoice.ReadAudioAsync(http, request, true, token, useQwen).ConfigureAwait(false);
+                            return await BreezeVoice.ReadAudioAsync(http, request, true, token, useQwen, streamReader).ConfigureAwait(false);
                         }
                     }
                     catch (LocalSpeechBusyException)
@@ -180,17 +185,66 @@ namespace Tingye
             finally { synthesis.Release(); }
         }
 
-        public async Task<byte[]> ChangeSpeedAsync(byte[] audio, float speed, CancellationToken token)
+        private Process StartTempo(float speed)
         {
-            if (speed == 1f) return audio;
             var info = new ProcessStartInfo(ffmpeg,
-                "-hide_banner -loglevel error -nostdin -filter_threads 1 -threads 1 -f s16le -ar 24000 -ac 1 -i pipe:0 -af atempo="
+                "-hide_banner -loglevel error -nostdin -filter_threads 1 -threads 1 -probesize 32 -analyzeduration 0 -f s16le -ar 24000 -ac 1 -i pipe:0 -af atempo="
                 + speed.ToString(CultureInfo.InvariantCulture)
-                + " -f s16le -ar 24000 -ac 1 pipe:1") {
+                + " -flush_packets 1 -f s16le -ar 24000 -ac 1 pipe:1") {
                 UseShellExecute = false, CreateNoWindow = true,
                 RedirectStandardInput = true, RedirectStandardOutput = true, RedirectStandardError = true
             };
-            using (var process = Process.Start(info))
+            return Process.Start(info);
+        }
+
+        private async Task<byte[]> ReadLiveAsync(Stream body, float speed, int tailMs, Func<byte[], Task> deliver, CancellationToken token)
+        {
+            if (speed == 1f) return await StreamingPcm.ReadAsync(body, tailMs, deliver, token).ConfigureAwait(false);
+            using (var process = StartTempo(speed))
+            using (token.Register(() => Terminate(process)))
+            {
+                var diagnostics = process.StandardError.ReadToEndAsync();
+                var drain = DrainTempoAsync(process, deliver, token);
+                var write = WriteLiveInputAsync(process, body, tailMs, token);
+                await Task.WhenAll(write, drain, diagnostics).ConfigureAwait(false);
+                token.ThrowIfCancellationRequested();
+                process.WaitForExit();
+                if (process.ExitCode != 0) throw new IOException("本地语音变速失败。");
+                return await write.ConfigureAwait(false);
+            }
+        }
+
+        private static async Task<byte[]> WriteLiveInputAsync(Process process, Stream body, int tailMs, CancellationToken token)
+        {
+            using (var input = process.StandardInput.BaseStream)
+                return await StreamingPcm.ReadAsync(body, tailMs, block => input.WriteAsync(block, 0, block.Length, token), token).ConfigureAwait(false);
+        }
+
+        private static async Task DrainTempoAsync(Process process, Func<byte[], Task> deliver, CancellationToken token)
+        {
+            try
+            {
+                var buffer = new byte[12288];
+                int used = 0, read;
+                var source = process.StandardOutput.BaseStream;
+                while ((read = await source.ReadAsync(buffer, used, buffer.Length - used, token).ConfigureAwait(false)) > 0)
+                {
+                    used += read;
+                    if (used < buffer.Length) continue;
+                    await deliver(buffer).ConfigureAwait(false);
+                    buffer = new byte[buffer.Length];
+                    used = 0;
+                }
+                if (used % 2 != 0) throw new IOException("变速音频不完整。");
+                if (used > 0) { Array.Resize(ref buffer, used); await deliver(buffer).ConfigureAwait(false); }
+            }
+            catch { Terminate(process); throw; }
+        }
+
+        public async Task<byte[]> ChangeSpeedAsync(byte[] audio, float speed, CancellationToken token)
+        {
+            if (speed == 1f) return audio;
+            using (var process = StartTempo(speed))
             using (var output = new MemoryStream())
             using (token.Register(() => Terminate(process)))
             {
@@ -217,6 +271,9 @@ namespace Tingye
         {
             string provider = useQwen ? "本地 Qwen3-TTS" : "本地 Breeze";
             token.ThrowIfCancellationRequested();
+            bool offloadEncoder = !useQwen && String.IsNullOrEmpty(Environment.GetEnvironmentVariable("BREEZE_TE_CPU"))
+                && await smallGpu.Value.ConfigureAwait(false);
+            token.ThrowIfCancellationRequested();
             Process process;
             Uri endpoint;
             lock (processGate)
@@ -236,11 +293,17 @@ namespace Tingye
                     string arguments = useQwen
                         ? "--ttsmodel \"" + qwenModel + "\" --ttswavtokenizer \"" + qwenTokenizer +
                           "\" --usevulkan 0 --ttsgpu --ttsmaxlen 1024 --quiet --skiplauncher"
-                        : "\"" + model + "\" --parallel 1 --no-warmup --ws-port -1 --voices-dir \"" + voices + "\"";
+                        : "\"" + model + "\" --no-warmup --ws-port -1 --voices-dir \"" + voices + "\"";
                     var info = new ProcessStartInfo(executable, arguments + " --host 127.0.0.1 --port " + port) {
                         WorkingDirectory = Path.GetDirectoryName(executable), UseShellExecute = false, CreateNoWindow = true,
                         RedirectStandardOutput = true, RedirectStandardError = true
                     };
+                    if (offloadEncoder)
+                    {
+                        info.EnvironmentVariables["BREEZE_TE_CPU"] = "1";
+                        if (String.IsNullOrEmpty(info.EnvironmentVariables["BREEZE_TE_THREADS"]))
+                            info.EnvironmentVariables["BREEZE_TE_THREADS"] = Math.Min(4, Environment.ProcessorCount).ToString(CultureInfo.InvariantCulture);
+                    }
                     serverJob = SpeechProcessJob.Create();
                     server = Process.Start(info);
                     serverJob.Add(server);
@@ -277,6 +340,26 @@ namespace Tingye
                 await Task.Delay(250, token).ConfigureAwait(false);
             }
             throw new IOException(provider + " 未能启动。请确认模型完整，并检查可用内存和显存。");
+        }
+
+        private static bool HasSmallNvidiaGpu()
+        {
+            var tool = Path.Combine(Environment.SystemDirectory, "nvidia-smi.exe");
+            if (!File.Exists(tool)) return false;
+            try
+            {
+                using (var probe = Process.Start(new ProcessStartInfo(tool, "--query-gpu=memory.total --format=csv,noheader,nounits") {
+                    UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true, RedirectStandardError = true
+                }))
+                {
+                    if (!probe.WaitForExit(1500)) { Terminate(probe); return false; }
+                    int mib;
+                    return probe.ExitCode == 0 && Int32.TryParse(probe.StandardOutput.ReadToEnd().Trim(), out mib)
+                        && mib > 0 && mib <= 6144;
+                }
+            }
+            catch (System.ComponentModel.Win32Exception) { return false; }
+            catch (IOException) { return false; }
         }
 
         private static int FindLocalPort()

@@ -19,7 +19,7 @@ namespace Tingye
         public const string VoiceName = "大肥鱼（机灵版）";
         public const int SampleRate = 24000;
         private const string Model = "breeze-tts-2";
-        private const int MaxAudioBytes = 8 * 1024 * 1024;
+        internal const int MaxAudioBytes = 8 * 1024 * 1024;
         private const long CacheLimit = 192L * 1024 * 1024;
         private const long CacheTrimReserve = 16L * 1024 * 1024;
         private const long PlaybackCacheLimit = 24L * 1024 * 1024;
@@ -75,7 +75,8 @@ namespace Tingye
             return (Environment.GetEnvironmentVariable("BREEZE_API_KEY") ?? "").Trim();
         }
 
-        public Task<byte[]> SynthesizeAsync(string text, bool paragraphEnd, float speed, CancellationToken token, bool useLocal = false)
+        public Task<byte[]> SynthesizeAsync(string text, bool paragraphEnd, float speed, CancellationToken token, bool useLocal = false,
+            Func<byte[], Task> streamAudio = null)
         {
             token.ThrowIfCancellationRequested();
             string input = SpeechText.ForSynthesis(text, paragraphEnd);
@@ -89,7 +90,8 @@ namespace Tingye
             });
             string identity = useLocal ? local.Identity : VoiceId;
             return SynthesizeCachedAsync(text, paragraphEnd, useLocal ? speed : 1f, token, identity, payload,
-                () => useLocal ? local.SynthesizeAsync(input, instructions, token) : SynthesizeCloudAsync(payload, token));
+                () => useLocal ? local.SynthesizeAsync(input, instructions, token, speed, SpeechText.TailPauseMs(text, paragraphEnd), streamAudio)
+                    : SynthesizeCloudAsync(payload, token), streamAudio != null && useLocal);
         }
 
         public Task<byte[]> SynthesizeQwenAsync(string text, bool paragraphEnd, float speed, CancellationToken token, NeuralVoice voice)
@@ -110,7 +112,7 @@ namespace Tingye
         }
 
         private async Task<byte[]> SynthesizeCachedAsync(string text, bool paragraphEnd, float speed,
-            CancellationToken token, string voice, string payload, Func<Task<byte[]>> synthesize)
+            CancellationToken token, string voice, string payload, Func<Task<byte[]>> synthesize, bool streamedOnMiss = false)
         {
             string cachedFile;
             using (var hash = SHA256.Create())
@@ -130,6 +132,8 @@ namespace Tingye
                 token.ThrowIfCancellationRequested();
                 pcm = NormalizePauses(pcm, SpeechText.TailPauseMs(text, paragraphEnd));
                 SaveCached(cachedFile, pcm);
+                // The player already received this clip, including its tempo conversion.
+                if (streamedOnMiss) return null;
             }
             token.ThrowIfCancellationRequested();
             if (speed != 1f)
@@ -190,7 +194,8 @@ namespace Tingye
         }
 
         internal static async Task<byte[]> ReadAudioAsync(HttpClient client, HttpRequestMessage request,
-            bool useLocal, CancellationToken token, bool qwen = false)
+            bool useLocal, CancellationToken token, bool qwen = false,
+            Func<Stream, CancellationToken, Task<byte[]>> streamReader = null)
         {
             string provider = qwen ? "本地 Qwen3-TTS" : useLocal ? "本地 Breeze" : "BreezeBlue";
             using (var timeout = CancellationTokenSource.CreateLinkedTokenSource(token))
@@ -205,17 +210,24 @@ namespace Tingye
                         using (var output = new MemoryStream())
                         using (timeout.Token.Register(body.Dispose))
                         {
-                            var buffer = new byte[16384];
-                            int read;
-                            while ((read = await body.ReadAsync(buffer, 0, buffer.Length, timeout.Token).ConfigureAwait(false)) != 0)
+                            byte[] data;
+                            if (streamReader != null)
+                                data = await streamReader(body, timeout.Token).ConfigureAwait(false);
+                            else
                             {
-                                if (output.Length + read > MaxAudioBytes) throw new IOException(provider + " 返回的音频过长。");
-                                output.Write(buffer, 0, read);
+                                var buffer = new byte[16384];
+                                int read;
+                                while ((read = await body.ReadAsync(buffer, 0, buffer.Length, timeout.Token).ConfigureAwait(false)) != 0)
+                                {
+                                    if (output.Length + read > MaxAudioBytes) throw new IOException(provider + " 返回的音频过长。");
+                                    output.Write(buffer, 0, read);
+                                }
+                                data = output.ToArray();
                             }
                             var expected = response.Content.Headers.ContentLength;
-                            if (expected.HasValue && expected.Value != output.Length)
+                            if (expected.HasValue && expected.Value != data.Length)
                                 throw new IOException(provider + " 返回的音频不完整。");
-                            byte[] pcm = qwen ? ReadWave(output.ToArray()) : output.ToArray();
+                            byte[] pcm = qwen ? ReadWave(data) : data;
                             if (!ValidPcm(pcm)) throw new IOException(provider + " 返回的音频为空或不完整。");
                             return pcm;
                         }
@@ -328,7 +340,7 @@ namespace Tingye
             return pcm;
         }
 
-        private static bool QuietPcm(byte[] pcm, int offset)
+        internal static bool QuietPcm(byte[] pcm, int offset)
         {
             int sample = unchecked((short)(pcm[offset] | pcm[offset + 1] << 8));
             return sample >= -32 && sample <= 32;

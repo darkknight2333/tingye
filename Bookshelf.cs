@@ -23,6 +23,7 @@ namespace Tingye
         private static readonly CompareInfo SearchComparer = CultureInfo.GetCultureInfo("zh-CN").CompareInfo;
         private const CompareOptions SearchOptions = CompareOptions.IgnoreCase | CompareOptions.IgnoreWidth | CompareOptions.IgnoreNonSpace;
         private static readonly RoutedCommand ToggleReadStatus = new RoutedCommand("ToggleReadStatus", typeof(Bookshelf));
+        private static readonly RoutedCommand DeleteBookCommand = new RoutedCommand("DeleteBook", typeof(Bookshelf));
         private readonly Library library;
         private readonly ListBox rows;
         private readonly ComboBox sort, readFilter;
@@ -39,8 +40,8 @@ namespace Tingye
         private bool rowsChanged = true;
         private int columns;
 
-        public Bookshelf(Window window, Library library, Func<ShelfEntry, Task> open, Action<ShelfEntry> rename,
-            Action<ShelfEntry> toggleRead, Action changed)
+        public Bookshelf(Window window, Library library, Func<ShelfEntry, FrameworkElement, Task> open, Action<ShelfEntry> rename,
+            Action<ShelfEntry> toggleRead, Action<ShelfEntry> delete, Action changed)
         {
             this.library = library;
             rows = (ListBox)window.FindName("ShelfRows");
@@ -111,17 +112,46 @@ namespace Tingye
                 args.CanExecute = rows.IsEnabled && args.Parameter is ShelfEntry;
                 args.Handled = true;
             }));
+            rows.CommandBindings.Add(new CommandBinding(DeleteBookCommand, (sender, args) => {
+                var selected = args.Parameter as ShelfEntry;
+                if (selected == null) return;
+                args.Handled = true;
+                delete(selected);
+            }, (sender, args) => {
+                args.CanExecute = rows.IsEnabled && args.Parameter is ShelfEntry;
+                args.Handled = true;
+            }));
             rows.AddHandler(Button.ClickEvent, new RoutedEventHandler(async (sender, args) => {
                 var button = args.OriginalSource as Button;
                 var selected = button == null ? null : button.CommandParameter as ShelfEntry;
                 if (selected == null) return;
                 args.Handled = true;
-                await open(selected);
+                await open(selected, FindCover(button, selected));
             }), true);
             resume.Click += async (sender, args) => {
                 var selected = library.Books.FirstOrDefault(item => item.Id == library.SelectedId);
-                if (selected != null) await open(selected);
+                if (selected != null) await open(selected, FindCover(rows, selected));
             };
+        }
+
+        public ImageSource CachedCover(ShelfEntry selected)
+        {
+            ImageSource image;
+            return covers.TryGetValue(selected.Id, out image) ? image : null;
+        }
+
+        private static FrameworkElement FindCover(DependencyObject parent, ShelfEntry selected)
+        {
+            var element = parent as FrameworkElement;
+            var tile = element == null ? null : element.DataContext as ShelfTile;
+            if (tile != null && tile.Entry == selected && element.Name == "ShelfCover" && element.IsVisible)
+                return element;
+            for (int i = 0; i < VisualTreeHelper.GetChildrenCount(parent); i++)
+            {
+                var found = FindCover(VisualTreeHelper.GetChild(parent, i), selected);
+                if (found != null) return found;
+            }
+            return null;
         }
 
         public void RestorePreferences()
@@ -283,6 +313,7 @@ namespace Tingye
             public bool IsRead { get { return Entry.IsRead; } }
             public string ReadAction { get { return IsRead ? "标为未读" : "标为已读"; } }
             public ICommand ReadCommand { get { return ToggleReadStatus; } }
+            public ICommand DeleteCommand { get { return DeleteBookCommand; } }
             public string Author { get; private set; }
             public string Description { get { return Title + "\n" + Author + "\n" + DateLabel + (IsRead ? "\n已读" : ""); } }
             public string DateLabel { get; private set; }

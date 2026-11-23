@@ -14,6 +14,7 @@ using System.Windows.Controls;
 using System.Windows.Controls.Primitives;
 using System.Windows.Input;
 using System.Windows.Media;
+using System.Windows.Media.Animation;
 using System.Windows.Media.Imaging;
 using System.Windows.Threading;
 using Microsoft.Win32;
@@ -32,8 +33,15 @@ namespace Tingye
         private readonly ComboBox shelf, voices, speeds;
         private readonly ListBox chapters, passages;
         private readonly Button play, previous, next, import, welcomeImport;
+        private readonly Button revealPlayer;
         private readonly Button scanBooks;
-        private readonly DispatcherTimer saveTimer;
+        private readonly DispatcherTimer saveTimer, playerHideTimer, readingScrollHideTimer;
+        private readonly Grid openingLayer;
+        private BookOpening bookOpening;
+        private FrameworkElement openingCoverSource;
+        private double openingCoverOpacity;
+        private ScrollBar readingScrollbar;
+        private double readingScrollbarOpacity;
         private readonly List<VoiceOption> availableVoices = new List<VoiceOption>();
         private readonly NaturalPlayback natural;
         private readonly BreezeVoice breezeVoice;
@@ -56,7 +64,7 @@ namespace Tingye
         private readonly Queue<string> requestedBooks = new Queue<string>();
         private bool shelfReady;
         private double infoWidth = 198;
-        private bool sidebarExpanded;
+        private bool sidebarExpanded, chapterHasNotes;
         private static readonly string[] ReadingFamilies = { "Microsoft YaHei", "SimSun", "KaiTi", "FangSong" };
 
         public ReaderWindow(Window window, Library library, string openFile, string speechDirectory = null)
@@ -66,6 +74,7 @@ namespace Tingye
             bookshelfPage = Find<FrameworkElement>("BookshelfPage");
             readerArea = Find<FrameworkElement>("ReaderArea");
             playerBar = Find<FrameworkElement>("PlayerBar");
+            openingLayer = Find<Grid>("BookOpeningLayer");
             var fontChoice = Find<ComboBox>("ReadingFont");
             var sizeChoice = Find<ComboBox>("ReadingFontSize");
             fontChoice.ItemsSource = new[] { "微软雅黑", "宋体", "楷体", "仿宋" };
@@ -94,15 +103,70 @@ namespace Tingye
             });
             Appearance.AnimateWhenShown(Text("ShelfTitle"));
             Appearance.AnimateWhenShown(Text("ChapterTitle"));
-            bookshelf = new Bookshelf(window, library, OpenBook, RenameBook, ToggleReadStatus, () => { dirty = true; });
+            var animateBookOpening = Find<CheckBox>("AnimateBookOpening");
+            RoutedEventHandler openingPreferenceChanged = delegate {
+                if (!shelfReady) return;
+                library.AnimateBookOpening = animateBookOpening.IsChecked == true;
+                dirty = true;
+                Save();
+            };
+            animateBookOpening.Checked += openingPreferenceChanged;
+            animateBookOpening.Unchecked += openingPreferenceChanged;
+            bookshelf = new Bookshelf(window, library, OpenBook, RenameBook, ToggleReadStatus, DeleteBook, () => { dirty = true; });
             shelf = Find<ComboBox>("Shelf");
             voices = Find<ComboBox>("Voices");
             speeds = Find<ComboBox>("Speeds");
             chapters = Find<ListBox>("Chapters");
             passages = Find<ListBox>("Passages");
+            readingScrollHideTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(900) };
+            readingScrollHideTimer.Tick += delegate {
+                readingScrollHideTimer.Stop();
+                if (!ReadingScrollbarInteracting) SetReadingScrollbarOpacity(0);
+            };
+            passages.IsVisibleChanged += delegate {
+                if (passages.IsVisible) AttachReadingScrollbar();
+                else
+                {
+                    readingScrollHideTimer.Stop();
+                    SetReadingScrollbarOpacity(0, false);
+                }
+            };
+            passages.AddHandler(ScrollViewer.ScrollChangedEvent, new ScrollChangedEventHandler((sender, args) => {
+                if (Math.Abs(args.VerticalChange) < 0.1 || !passages.IsVisible) return;
+                AttachReadingScrollbar();
+                ShowReadingScrollbar();
+            }));
+            UpdateNotesVisibility();
             play = Find<Button>("Play");
             previous = Find<Button>("PreviousChapter");
             next = Find<Button>("NextChapter");
+            revealPlayer = Find<Button>("RevealPlayer");
+            playerHideTimer = new DispatcherTimer();
+            playerHideTimer.Tick += delegate {
+                playerHideTimer.Stop();
+                if (!playerBar.IsMouseOver) HidePlayerBar();
+            };
+            playerBar.MouseLeave += delegate { if (!playerHideTimer.IsEnabled) HidePlayerBar(); };
+            revealPlayer.MouseEnter += delegate { ShowPlayerBar(); };
+            revealPlayer.Click += delegate {
+                ShowPlayerBar();
+                if (!play.Focus()) passages.Focus();
+            };
+            var autoHidePlayer = Find<CheckBox>("AutoHidePlayer");
+            var playerHideDelay = Find<ComboBox>("PlayerHideDelay");
+            playerHideDelay.ItemsSource = Library.PlayerHideDelays
+                .Select(seconds => new KeyValuePair<int, string>(seconds, seconds + " 秒")).ToArray();
+            RoutedEventHandler playerVisibilityChanged = delegate {
+                if (!shelfReady || playerHideDelay.SelectedItem == null) return;
+                library.AutoHidePlayer = autoHidePlayer.IsChecked == true;
+                library.PlayerHideDelay = ((KeyValuePair<int, string>)playerHideDelay.SelectedItem).Key;
+                ShowPlayerBar();
+                dirty = true;
+                Save();
+            };
+            autoHidePlayer.Checked += playerVisibilityChanged;
+            autoHidePlayer.Unchecked += playerVisibilityChanged;
+            playerHideDelay.SelectionChanged += (sender, args) => playerVisibilityChanged(sender, args);
             import = Find<Button>("ImportButton");
             welcomeImport = Find<Button>("WelcomeImport");
             scanBooks = Find<Button>("ScanBooksFolder");
@@ -138,6 +202,19 @@ namespace Tingye
                 SelectPage(Page.Settings);
                 UpdatePlayer();
             };
+            Find<Button>("OpenShortcuts").Click += delegate {
+                SelectPage(Page.Shortcuts);
+                Find<Button>("BackToSettings").Focus();
+            };
+            Find<Button>("BackToSettings").Click += delegate {
+                SelectPage(Page.Settings);
+                Find<Button>("OpenShortcuts").Focus();
+            };
+            Find<Button>("ResetShortcuts").Click += delegate {
+                library.KeyboardShortcuts = new Shortcuts();
+                SaveShortcuts();
+            };
+            Find<ItemsControl>("ShortcutBindings").AddHandler(ButtonBase.ClickEvent, new RoutedEventHandler(EditShortcut));
             Find<RadioButton>("ReaderNav").Click += async delegate {
                 SelectPage(Page.Reading);
                 UpdatePlayer();
@@ -167,8 +244,13 @@ namespace Tingye
                 var row = passages.SelectedItem as PassageRow;
                 if (!syncing && !loading && row != null && !row.IsSpacer) Seek(entry.Chapter, passages.SelectedIndex - 1);
             };
-            passages.SizeChanged += delegate {
-                passages.Tag = passages.ActualHeight * 0.75;
+            passages.SizeChanged += (sender, args) => {
+                // Keep the scroll padding and the visible text in place when just the player changes height.
+                double playerHeight = playerBar.Visibility == Visibility.Visible ? playerBar.Height :
+                    revealPlayer.Visibility == Visibility.Visible ? revealPlayer.Height : 0;
+                double padding = Math.Max(0, args.NewSize.Height + playerHeight - playerBar.Height) * 0.75;
+                if (!args.WidthChanged && passages.Tag is double && Math.Abs((double)passages.Tag - padding) < 0.5) return;
+                passages.Tag = padding;
                 SchedulePassageCenter();
             };
             voices.SelectionChanged += delegate {
@@ -197,6 +279,7 @@ namespace Tingye
                 if (!loading && path != null) await ImportBook(path, bookshelfPage.Visibility != Visibility.Visible);
             };
             window.Closing += (sender, args) => {
+                EndBookOpening();
                 if (loading)
                 {
                     closing = true;
@@ -216,6 +299,8 @@ namespace Tingye
             };
             window.Closed += delegate {
                 saveTimer.Stop();
+                playerHideTimer.Stop();
+                readingScrollHideTimer.Stop();
                 breezeVoice.Close();
                 if (synthesizer != null) synthesizer.Dispose();
             };
@@ -266,6 +351,10 @@ namespace Tingye
                 int savedSize = library.ReadingSize;
                 fontChoice.SelectedIndex = Math.Max(0, Array.IndexOf(ReadingFamilies, library.ReadingFont));
                 sizeChoice.SelectedItem = savedSize >= 14 && savedSize <= 32 ? savedSize : 17;
+                autoHidePlayer.IsChecked = library.AutoHidePlayer;
+                playerHideDelay.SelectedValue = library.PlayerHideDelay;
+                animateBookOpening.IsChecked = library.AnimateBookOpening;
+                RefreshShortcuts();
                 shelfReady = true;
                 if (!String.IsNullOrWhiteSpace(openFile)) await ImportBook(openFile, true);
                 else OpenNextRequest();
@@ -322,13 +411,15 @@ namespace Tingye
             BeginLoading(openAfterImport);
             try
             {
-                ImageSource cover = null;
+                ImageSource cover = null, largeCover = null;
+                bool animate = openAfterImport && library.AnimateBookOpening && SystemParameters.ClientAreaAnimation;
                 var imported = await Task.Run(() => {
                     var result = library.Import(path);
                     if (openAfterImport)
                     {
                         result.Book.IndexChapterLengths();
                         cover = DecodeCover(result.Book.Cover);
+                        if (animate) largeCover = DecodeCover(result.Book.Cover, 1100);
                     }
                     return result;
                 });
@@ -340,11 +431,16 @@ namespace Tingye
                     bookshelf.InvalidateRows();
                     dirty = true;
                 }
-                if (openAfterImport) SetBook(selected, imported.Book, cover);
+                if (openAfterImport && !closing)
+                {
+                    if (animate) StartBookOpening(selected.DisplayTitle, largeCover ?? cover, null);
+                    SetBook(selected, imported.Book, cover);
+                    await RevealOpenedBook(largeCover);
+                }
                 Save();
             }
             catch (Exception ex) { ShowNotice("导入失败。" + DescribeBookError(ex)); }
-            finally { EndLoading(); }
+            finally { EndBookOpening(); EndLoading(); }
         }
 
         private void OpenBooksFolder()
@@ -396,30 +492,90 @@ namespace Tingye
             }
         }
 
-        private async Task OpenBook(ShelfEntry selected)
+        private async Task OpenBook(ShelfEntry selected, FrameworkElement coverSource = null)
         {
             if (loading) return;
-            if (selected == entry && book != null)
-            {
-                TouchRead();
-                ShowReaderPage();
-                UpdatePlayer();
-                SchedulePassageCenter();
-                return;
-            }
-            BeginLoading();
+            bool same = selected == entry && book != null;
+            bool animate = library.AnimateBookOpening && SystemParameters.ClientAreaAnimation;
+            BeginLoading(!same);
             try
             {
-                ImageSource cover = null;
+                ImageSource cover = null, largeCover = null;
+                if (animate)
+                    StartBookOpening(selected.DisplayTitle, bookshelf.CachedCover(selected) ??
+                        (same ? Find<Image>("CoverImage").Source : null), coverSource);
+                if (same)
+                {
+                    if (bookOpening != null)
+                    {
+                        byte[] coverBytes = book.Cover;
+                        largeCover = await Task.Run(() => DecodeCover(coverBytes, 1100));
+                    }
+                    if (closing) return;
+                    TouchRead();
+                    ShowReaderPage();
+                    UpdatePlayer();
+                    SchedulePassageCenter();
+                    await RevealOpenedBook(largeCover);
+                    return;
+                }
                 var opened = await Task.Run(() => {
                     var result = library.Open(selected);
                     cover = DecodeCover(result.Cover);
+                    if (animate) largeCover = DecodeCover(result.Cover, 1100);
                     return result;
                 });
+                if (closing) return;
                 SetBook(selected, opened, cover);
+                await RevealOpenedBook(largeCover);
             }
             catch (Exception ex) { ShowNotice("无法打开这本书。" + DescribeBookError(ex)); }
-            finally { EndLoading(); }
+            finally { EndBookOpening(); EndLoading(); }
+        }
+
+        private void StartBookOpening(string title, ImageSource cover, FrameworkElement source)
+        {
+            var root = (FrameworkElement)window.Content;
+            Rect origin = Rect.Empty;
+            if (source != null && source.IsVisible && source.ActualWidth > 0 && source.ActualHeight > 0)
+            {
+                var point = source.TranslatePoint(new Point(0, 0), root);
+                var bounds = new Rect(point, source.RenderSize);
+                if (new Rect(root.RenderSize).Contains(bounds))
+                {
+                    origin = bounds;
+                    openingCoverSource = source;
+                    openingCoverOpacity = source.Opacity;
+                    source.Opacity = 0;
+                }
+            }
+            bookOpening = new BookOpening(title, cover, origin, (Brush)window.FindResource("Paper"),
+                (Brush)window.FindResource("Surface"), (Brush)window.FindResource("PrimaryFill"),
+                (Brush)window.FindResource("Ink"));
+            openingLayer.Children.Add(bookOpening);
+            openingLayer.Visibility = Visibility.Visible;
+            bookOpening.Start();
+        }
+
+        private Task RevealOpenedBook(ImageSource cover)
+        {
+            if (bookOpening == null) return Task.FromResult(true);
+            bookOpening.ReaderReady(cover, ReadingPercent());
+            return bookOpening.Finished;
+        }
+
+        private void EndBookOpening()
+        {
+            if (bookOpening == null) return;
+            bookOpening.End();
+            openingLayer.Visibility = Visibility.Collapsed;
+            openingLayer.Children.Clear();
+            bookOpening = null;
+            if (openingCoverSource != null)
+            {
+                openingCoverSource.Opacity = openingCoverOpacity;
+                openingCoverSource = null;
+            }
         }
 
         private static string DescribeBookError(Exception error)
@@ -597,7 +753,10 @@ namespace Tingye
             var panel = new StackPanel { Margin = new Thickness(23) };
             var name = new TextBox { Text = selected.DisplayTitle, Padding = new Thickness(8, 6, 8, 6),
                 Margin = new Thickness(0, 5, 0, 12) };
-            panel.Children.Add(new Label { Content = "显示书名", Target = name, Padding = new Thickness(0) });
+            ApplyInputColors(name, TextBoxBase.CaretBrushProperty);
+            var label = new Label { Content = "显示书名", Target = name, Padding = new Thickness(0) };
+            label.SetResourceReference(Control.ForegroundProperty, "Ink");
+            panel.Children.Add(label);
             AutomationProperties.SetName(name, "显示书名");
             panel.Children.Add(name);
             panel.Children.Add(new TextBlock { Text = "原书名：" + selected.Title, TextWrapping = TextWrapping.Wrap,
@@ -639,7 +798,44 @@ namespace Tingye
             bookshelf.Refresh();
         }
 
-        private enum Page { Shelf, Reading, Settings }
+        private void DeleteBook(ShelfEntry selected)
+        {
+            if (loading || closing) return;
+            if (Choose("删除书籍", "删除《" + selected.DisplayTitle + "》？\n\n这会删除它的书架记录、阅读进度和书库内的 EPUB 副本。",
+                "取消", "删除书籍") != 1 || loading || closing) return;
+
+            bool deletedFile;
+            try { deletedFile = library.RemoveBook(selected); }
+            catch (Exception error)
+            {
+                ShowNotice("无法删除这本书。" + error.GetBaseException().Message);
+                return;
+            }
+
+            dirty = false;
+            if (entry == selected)
+            {
+                StopSpeech();
+                entry = null;
+                book = null;
+                passageOffsets = null;
+                contentsRoots = null;
+                contentsByChapter = null;
+                visibleContents = null;
+                chapters.ItemsSource = null;
+                passages.ItemsSource = null;
+                Find<Image>("CoverImage").Source = null;
+                SelectPage(Page.Shelf);
+            }
+            if (mostRecentlyTouched == selected) mostRecentlyTouched = null;
+            bookshelf.InvalidateRows();
+            RefreshShelf();
+            bookshelf.Refresh();
+            UpdatePlayer();
+            if (!deletedFile) ShowNotice("已移出书架。听页下次启动时会重试清理暂存的 EPUB 副本。");
+        }
+
+        private enum Page { Shelf, Reading, Settings, Shortcuts }
         private void ToggleSidebar()
         {
             var info = Find<ColumnDefinition>("InfoColumn");
@@ -653,9 +849,18 @@ namespace Tingye
             Find<ColumnDefinition>("DividerColumn").Width = new GridLength(sidebarExpanded ? 4 : 0);
             info.MinWidth = sidebarExpanded ? 150 : 0;
             info.Width = new GridLength(sidebarExpanded ? infoWidth : 0);
-            var toggle = Find<Button>("ExpandNav");
-            toggle.ToolTip = sidebarExpanded ? "收起侧栏" : "展开侧栏";
-            AutomationProperties.SetName(toggle, (string)toggle.ToolTip);
+            UpdateSidebarShortcutHint();
+            UpdateNotesVisibility();
+            SchedulePassageCenter();
+        }
+
+        private void UpdateNotesVisibility()
+        {
+            bool showNotes = sidebarExpanded && chapterHasNotes;
+            passages.Resources["ReadingNotesWidth"] = new GridLength(showNotes ? 1 : 0,
+                showNotes ? GridUnitType.Star : GridUnitType.Pixel);
+            passages.Resources["ReadingNotesVisibility"] = showNotes ? Visibility.Visible : Visibility.Collapsed;
+            Find<FrameworkElement>("Reader").MaxWidth = showNotes ? 1050 : 870;
             CenterReadingColumn();
         }
 
@@ -666,10 +871,31 @@ namespace Tingye
             double width = ((FrameworkElement)window.Content).ActualWidth;
             info.MaxWidth = Math.Max(150, Math.Min(430, width / 2 - rail - 152));
             double inset = rail + (sidebarExpanded ? info.ActualWidth + 4 : 0);
-            Find<FrameworkElement>("TextHost").Margin = new Thickness(0, 0, inset, 0);
+            Find<FrameworkElement>("TextHost").Margin = new Thickness(0, 0, sidebarExpanded && chapterHasNotes ? 18 : inset, 0);
         }
 
         private Page currentPage = Page.Shelf;
+
+        private void ShowPlayerBar()
+        {
+            playerHideTimer.Stop();
+            bool reading = currentPage == Page.Reading && book != null;
+            playerBar.Visibility = reading ? Visibility.Visible : Visibility.Collapsed;
+            revealPlayer.Visibility = Visibility.Collapsed;
+            if (reading && library.AutoHidePlayer)
+            {
+                playerHideTimer.Interval = TimeSpan.FromSeconds(library.PlayerHideDelay);
+                playerHideTimer.Start();
+            }
+        }
+
+        private void HidePlayerBar()
+        {
+            if (currentPage != Page.Reading || !library.AutoHidePlayer || playerBar.Visibility != Visibility.Visible) return;
+            if (playerBar.IsKeyboardFocusWithin) passages.Focus();
+            playerBar.Visibility = Visibility.Collapsed;
+            revealPlayer.Visibility = Visibility.Visible;
+        }
 
         private void SelectPage(Page page)
         {
@@ -679,7 +905,9 @@ namespace Tingye
             readerArea.Visibility = page == Page.Reading && book != null ? Visibility.Visible : Visibility.Collapsed;
             Find<FrameworkElement>("EmptyReader").Visibility = page == Page.Reading && book == null ? Visibility.Visible : Visibility.Collapsed;
             Find<FrameworkElement>("SettingsPage").Visibility = page == Page.Settings ? Visibility.Visible : Visibility.Collapsed;
-            Find<RadioButton>(page == Page.Reading ? "ReaderNav" : page == Page.Settings ? "SettingsNav" : "ShelfButton").IsChecked = true;
+            Find<FrameworkElement>("ShortcutsPage").Visibility = page == Page.Shortcuts ? Visibility.Visible : Visibility.Collapsed;
+            Find<RadioButton>(page == Page.Reading ? "ReaderNav" : page == Page.Shelf ? "ShelfButton" : "SettingsNav").IsChecked = true;
+            ShowPlayerBar();
         }
 
         private void ShowReaderPage()
@@ -715,7 +943,7 @@ namespace Tingye
             shelf.IsEnabled = !loading && library.Books.Count > 0;
         }
 
-        internal static ImageSource DecodeCover(byte[] cover)
+        internal static ImageSource DecodeCover(byte[] cover, int width = 168)
         {
             if (cover == null) return null;
             try
@@ -725,7 +953,7 @@ namespace Tingye
                     var image = new BitmapImage();
                     image.BeginInit();
                     image.StreamSource = stream;
-                    image.DecodePixelWidth = 168;
+                    image.DecodePixelWidth = width;
                     image.CacheOption = BitmapCacheOption.OnLoad;
                     image.EndInit();
                     image.Freeze();
@@ -748,6 +976,7 @@ namespace Tingye
                 Text("ChapterTitle").Text = chapter.Title;
                 Text("ChapterTitle").ToolTip = chapter.Title;
                 var rows = new List<PassageRow>(chapter.Passages.Count + 2);
+                chapterHasNotes = false;
                 var sectionTitles = chapter.Sections.ToDictionary(section => section.Passage, section => section.Title);
                 rows.Add(new PassageRow(null));
                 passageOffsets = new long[chapter.Passages.Count];
@@ -758,11 +987,14 @@ namespace Tingye
                     offset += chapter.Passages[i].Length;
                     string heading;
                     sectionTitles.TryGetValue(i, out heading);
-                    rows.Add(new PassageRow(chapter.Passages[i], heading));
+                    List<ReadingNote> notes;
+                    if (book.Notes.TryGetValue(chapter.Start + i, out notes)) chapterHasNotes = true;
+                    rows.Add(new PassageRow(chapter.Passages[i], heading, notes));
                 }
                 rows.Add(new PassageRow(null));
                 bool replacingChapter = passages.ItemsSource != null;
                 passages.ItemsSource = rows;
+                UpdateNotesVisibility();
                 if (replacingChapter) Appearance.AnimateEntry(Text("ChapterTitle"));
             }
             SelectCurrentContents(true);
@@ -850,6 +1082,46 @@ namespace Tingye
             return null;
         }
 
+        private void AttachReadingScrollbar()
+        {
+            if (readingScrollbar != null) return;
+            passages.ApplyTemplate();
+            var viewer = FindScrollViewer(passages);
+            if (viewer == null) return;
+            viewer.ApplyTemplate();
+            readingScrollbar = viewer.Template.FindName("PART_VerticalScrollBar", viewer) as ScrollBar;
+            if (readingScrollbar == null) return;
+            // Opacity leaves the scroll hit area and the text column width intact.
+            readingScrollbar.MouseEnter += delegate { ShowReadingScrollbar(); };
+            readingScrollbar.MouseLeave += delegate { ShowReadingScrollbar(); };
+            readingScrollbar.IsMouseCaptureWithinChanged += delegate { ShowReadingScrollbar(); };
+        }
+
+        private bool ReadingScrollbarInteracting
+        {
+            get { return readingScrollbar != null && (readingScrollbar.IsMouseOver || readingScrollbar.IsMouseCaptureWithin); }
+        }
+
+        private void ShowReadingScrollbar()
+        {
+            if (closing || readingScrollbar == null || !readingScrollbar.IsVisible) return;
+            SetReadingScrollbarOpacity(ReadingScrollbarInteracting ? .68 : .48);
+            readingScrollHideTimer.Stop();
+            readingScrollHideTimer.Start();
+        }
+
+        private void SetReadingScrollbarOpacity(double opacity, bool animate = true)
+        {
+            if (readingScrollbar == null || (animate && readingScrollbarOpacity == opacity)) return;
+            double from = readingScrollbar.Opacity;
+            readingScrollbarOpacity = opacity;
+            readingScrollbar.BeginAnimation(UIElement.OpacityProperty, null);
+            readingScrollbar.Opacity = opacity;
+            if (animate && SystemParameters.ClientAreaAnimation && Math.Abs(from - opacity) > .01)
+                readingScrollbar.BeginAnimation(UIElement.OpacityProperty, new DoubleAnimation(from, opacity,
+                    TimeSpan.FromMilliseconds(160)) { FillBehavior = FillBehavior.Stop });
+        }
+
         private bool CenterPassage(ScrollViewer viewer, ScrollContentPresenter viewport, ListBoxItem item)
         {
             double height = viewport.ActualHeight;
@@ -931,13 +1203,15 @@ namespace Tingye
 
         private sealed class PassageRow
         {
-            public PassageRow(string text, string heading = null)
+            public PassageRow(string text, string heading = null, List<ReadingNote> notes = null)
             {
                 Text = text;
                 SectionHeading = heading;
+                Notes = notes;
             }
             public string Text { get; private set; }
             public string SectionHeading { get; private set; }
+            public List<ReadingNote> Notes { get; private set; }
             public bool IsHeadingText { get { return SectionHeading != null && SectionHeading == Text; } }
             public bool IsSpacer { get { return Text == null; } }
         }
@@ -999,8 +1273,16 @@ namespace Tingye
         {
             try
             {
+                int chapter = entry.Chapter, passage = entry.Passage;
+                if (!book.FindSpeechPassage(ref chapter, ref passage))
+                {
+                    StopSpeech();
+                    MarkPlaybackFinished();
+                    return;
+                }
+                if (chapter != entry.Chapter || passage != entry.Passage) ChangePosition(chapter, passage);
                 var voice = SelectedVoice();
-                string text = book.Chapters[entry.Chapter].Passages[entry.Passage];
+                string text = book.SpeechAt(chapter, passage);
                 if (voice == null) throw new InvalidOperationException("请先选择可用的语音。");
                 if (voice.Neural == NeuralVoice.BreezeBlue && !breezeVoice.HasKey && !ConfigureBreeze())
                 {
@@ -1013,7 +1295,7 @@ namespace Tingye
                 if (voice.Neural.HasValue)
                 {
                     var rate = (RateOption)speeds.SelectedItem;
-                    breeze.Speak(book, entry.Chapter, entry.Passage, rate.NaturalSpeed, voice.Neural.Value);
+                    breeze.Speak(book, chapter, passage, rate.NaturalSpeed, voice.Neural.Value);
                 }
                 else if (voice.Speaker.HasValue)
                 {
@@ -1037,9 +1319,8 @@ namespace Tingye
 
         private string NextPassageText()
         {
-            var chapter = book.Chapters[entry.Chapter];
-            if (entry.Passage + 1 < chapter.Passages.Count) return chapter.Passages[entry.Passage + 1];
-            return entry.Chapter + 1 < book.Chapters.Count ? book.Chapters[entry.Chapter + 1].Passages[0] : null;
+            int chapter = entry.Chapter, passage = entry.Passage + 1;
+            return book.FindSpeechPassage(ref chapter, ref passage) ? book.SpeechAt(chapter, passage) : null;
         }
 
         private VoiceOption SelectedVoice()
@@ -1111,16 +1392,14 @@ namespace Tingye
             bool continuePlaying = playing;
             playing = false;
 
-            if (entry.Passage + 1 < book.Chapters[entry.Chapter].Passages.Count)
-                ChangePosition(entry.Chapter, entry.Passage + 1);
-            else if (entry.Chapter + 1 < book.Chapters.Count)
-                ChangePosition(entry.Chapter + 1, 0);
-            else
+            int chapter = entry.Chapter, passage = entry.Passage + 1;
+            if (!book.FindSpeechPassage(ref chapter, ref passage))
             {
                 if (natural != null) natural.Stop();
                 MarkPlaybackFinished();
                 return;
             }
+            ChangePosition(chapter, passage);
             if (continuePlaying) SpeakCurrent();
             else if (natural != null) natural.Stop();
         }
@@ -1169,14 +1448,11 @@ namespace Tingye
             import.IsEnabled = welcomeImport.IsEnabled = !loading;
             scanBooks.IsEnabled = !loading;
             bookshelf.SetLoading(loading);
-            playerBar.Visibility = currentPage == Page.Reading && hasBook ? Visibility.Visible : Visibility.Collapsed;
-
             string label = playing ? "暂停" : HasActiveSpeech ? "继续" : hasBook && entry.Finished ? "重听" : "朗读";
             Text("PlayLabel").Text = label;
             AutomationProperties.SetName(play, label);
             Find<System.Windows.Shapes.Path>("PlayGlyph").Data = playing ? PauseIcon : PlayIcon;
-            double percent = !hasBook ? 0 : entry.Finished ? 100 :
-                passageOffsets[entry.Passage] * 100.0 / Math.Max(1L, book.CharacterCount);
+            double percent = ReadingPercent();
             Find<ProgressBar>("Progress").Value = percent;
             Text("ProgressPercent").Text = Math.Floor(percent) + "%";
             Text("PlayerTitle").Text = hasBook ? book.Chapters[entry.Chapter].Title : "等待导入";
@@ -1190,6 +1466,12 @@ namespace Tingye
                     : HasActiveSpeech ? "已暂停" : "准备朗读";
                 Text("PlayerStatus").Text = String.Format("{0} · 第 {1} / {2} 段", status, entry.Passage + 1, book.Chapters[entry.Chapter].Passages.Count);
             }
+        }
+
+        private double ReadingPercent()
+        {
+            if (book == null || entry == null) return 0;
+            return entry.Finished ? 100 : passageOffsets[entry.Passage] * 100.0 / Math.Max(1L, book.CharacterCount);
         }
 
         private bool Save()
@@ -1207,7 +1489,16 @@ namespace Tingye
                 FontSize = 14, Icon = window.Icon, Background = (Brush)window.FindResource("Paper"),
                 Foreground = (Brush)window.FindResource("Ink") };
             dialog.Resources[typeof(Button)] = window.FindResource("ShelfAction");
+            Appearance.ApplyTitleBar(dialog, library.Theme == Appearance.NightMode);
             return dialog;
+        }
+
+        private static void ApplyInputColors(Control input, DependencyProperty caret)
+        {
+            input.SetResourceReference(Control.BackgroundProperty, "Surface");
+            input.SetResourceReference(Control.ForegroundProperty, "Ink");
+            input.SetResourceReference(Control.BorderBrushProperty, "Line");
+            input.SetResourceReference(caret, "Ink");
         }
 
         private int Choose(string title, string message, params string[] labels)
@@ -1249,9 +1540,11 @@ namespace Tingye
                 TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 0, 0, 10)
             });
             var key = new PasswordBox { Margin = new Thickness(0, 0, 0, 8), MinHeight = 30 };
+            ApplyInputColors(key, PasswordBox.CaretBrushProperty);
             AutomationProperties.SetName(key, "BreezeBlue API 密钥");
             panel.Children.Add(key);
-            var error = new TextBlock { TextWrapping = TextWrapping.Wrap, Foreground = Brushes.Firebrick };
+            var error = new TextBlock { TextWrapping = TextWrapping.Wrap };
+            error.SetResourceReference(TextBlock.ForegroundProperty, "ErrorText");
             panel.Children.Add(error);
             var buttons = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Right };
             var manage = new Button { Content = "打开密钥管理", Padding = new Thickness(8, 4, 8, 4) };
@@ -1275,27 +1568,112 @@ namespace Tingye
             return dialog.ShowDialog() == true;
         }
 
+        private void RefreshShortcuts()
+        {
+            Find<ItemsControl>("ShortcutBindings").ItemsSource = library.KeyboardShortcuts.Bindings;
+            play.ToolTip = ShortcutHint("播放 / 暂停", ShortcutAction.Playback);
+            previous.ToolTip = ShortcutHint("上一章", ShortcutAction.PreviousChapter);
+            next.ToolTip = ShortcutHint("下一章", ShortcutAction.NextChapter);
+            UpdateSidebarShortcutHint();
+        }
+
+        private string ShortcutHint(string label, ShortcutAction action)
+        {
+            return label + "（" + library.KeyboardShortcuts[action].KeyLabel + "）";
+        }
+
+        private void UpdateSidebarShortcutHint()
+        {
+            var button = Find<Button>("ExpandNav");
+            string label = sidebarExpanded ? "收起侧栏" : "展开侧栏";
+            button.ToolTip = ShortcutHint(label, ShortcutAction.Sidebar);
+            AutomationProperties.SetName(button, label);
+        }
+
+        private void SaveShortcuts()
+        {
+            RefreshShortcuts();
+            dirty = true;
+            Save();
+        }
+
+        private void EditShortcut(object sender, RoutedEventArgs args)
+        {
+            var button = args.OriginalSource as Button;
+            var binding = button == null ? null : button.DataContext as ShortcutBinding;
+            if (binding == null) return;
+
+            var dialog = CreateDialog("修改快捷键", 430);
+            InputMethod.SetIsInputMethodEnabled(dialog, false);
+            var panel = new StackPanel { Margin = new Thickness(18) };
+            panel.Children.Add(new TextBlock { Text = binding.Label, FontSize = 18, FontWeight = FontWeights.SemiBold });
+            var hint = new TextBlock {
+                Text = "按下新的快捷键。按 Esc 取消。", TextWrapping = TextWrapping.Wrap,
+                Margin = new Thickness(0, 12, 0, 14)
+            };
+            panel.Children.Add(hint);
+            var cancel = new Button { Content = "取消", IsCancel = true, HorizontalAlignment = HorizontalAlignment.Right };
+            panel.Children.Add(cancel);
+            dialog.Content = panel;
+            dialog.PreviewKeyDown += (origin, keyArgs) => {
+                Key key = Shortcuts.EventKey(keyArgs);
+                if (key == Key.Escape || key == Key.Tab || key == Key.Enter) return;
+                keyArgs.Handled = true;
+                if (keyArgs.IsRepeat || Shortcuts.IsModifier(key)) return;
+
+                ModifierKeys modifiers = Keyboard.Modifiers;
+                if (!Shortcuts.CanAssign(key, modifiers))
+                {
+                    hint.Text = "此键无法设为快捷键，请试试字母、功能键或带 Ctrl 的组合键。";
+                    return;
+                }
+                var conflict = library.KeyboardShortcuts.Match(key, modifiers);
+                if (conflict != null && conflict != binding)
+                {
+                    hint.Text = Shortcuts.Format(key, modifiers) + " 已用于「" + conflict.Label + "」。请换一个键。";
+                    return;
+                }
+                binding.Set(key, modifiers);
+                dialog.DialogResult = true;
+            };
+            if (dialog.ShowDialog() == true) SaveShortcuts();
+        }
+
         private void OnKey(object sender, KeyEventArgs args)
         {
-            if (args.Key == Key.F && Keyboard.Modifiers == ModifierKeys.Control && bookshelfPage.Visibility == Visibility.Visible)
+            if (bookOpening != null)
             {
+                if (args.Key == Key.Escape) EndBookOpening();
                 args.Handled = true;
-                bookshelf.FocusSearch();
+                return;
             }
-            else if (args.Key == Key.O && Keyboard.Modifiers == ModifierKeys.Control)
+            var binding = library.KeyboardShortcuts.Match(Shortcuts.EventKey(args), Keyboard.Modifiers);
+            if (binding == null) return;
+
+            var combo = args.OriginalSource as ComboBox;
+            if (args.OriginalSource is ComboBoxItem || (combo != null && (combo.IsEditable || combo.IsDropDownOpen))) return;
+            ShortcutAction action = binding.Action;
+            if (args.OriginalSource is TextBoxBase || args.OriginalSource is PasswordBox)
             {
-                args.Handled = true;
-                PickFile();
+                bool existingTextShortcut = binding.Modifiers == ModifierKeys.Control &&
+                    ((action == ShortcutAction.Search && binding.Key == Key.F) ||
+                     (action == ShortcutAction.Import && binding.Key == Key.O));
+                if (!existingTextShortcut) return;
             }
-            else if (args.Key == Key.Space && Keyboard.Modifiers == ModifierKeys.None &&
-                currentPage == Page.Reading &&
-                !(Keyboard.FocusedElement is ButtonBase) && !(Keyboard.FocusedElement is ComboBox) &&
-                !(Keyboard.FocusedElement is TextBoxBase) &&
-                !voices.IsDropDownOpen && !speeds.IsDropDownOpen && !shelf.IsDropDownOpen &&
-                !Find<ComboBox>("ThemeChoice").IsDropDownOpen)
+            if (action == ShortcutAction.Search && currentPage != Page.Shelf) return;
+            if ((action == ShortcutAction.Playback || action == ShortcutAction.PreviousChapter ||
+                action == ShortcutAction.NextChapter) && (currentPage != Page.Reading || book == null)) return;
+
+            args.Handled = true;
+            if (args.IsRepeat || loading) return;
+            switch (action)
             {
-                args.Handled = true;
-                if (!args.IsRepeat) TogglePlayback();
+                case ShortcutAction.Playback: TogglePlayback(); break;
+                case ShortcutAction.PreviousChapter: Seek(entry.Chapter - 1, 0); break;
+                case ShortcutAction.NextChapter: Seek(entry.Chapter + 1, 0); break;
+                case ShortcutAction.Sidebar: ToggleSidebar(); break;
+                case ShortcutAction.Import: PickFile(); break;
+                case ShortcutAction.Search: bookshelf.FocusSearch(); break;
             }
         }
 

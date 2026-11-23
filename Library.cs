@@ -48,6 +48,7 @@ namespace Tingye
     internal sealed class Library
     {
         private static readonly Regex BookId = new Regex(@"^[0-9a-f]{64}\z");
+        private const string RemovingSuffix = ".epub.removing";
         private static readonly HashSet<string> OtherBookFormats = new HashSet<string>(StringComparer.OrdinalIgnoreCase) {
             ".mobi", ".azw", ".azw3", ".azw4", ".pdf", ".txt", ".fb2", ".fbz", ".rtf", ".doc", ".docx", ".djvu", ".cbz", ".cbr"
         };
@@ -62,6 +63,12 @@ namespace Tingye
         public string SelectedId, PreferredVoice, Theme;
         public string ReadingFont;
         public int ReadingSize;
+        public const int DefaultPlayerHideDelay = 30;
+        public static readonly int[] PlayerHideDelays = { 5, 10, 15, 20, DefaultPlayerHideDelay, 45, 60, 90, 120, 180, 300 };
+        public bool AutoHidePlayer = true;
+        public bool AnimateBookOpening = true;
+        public int PlayerHideDelay = DefaultPlayerHideDelay;
+        public Shortcuts KeyboardShortcuts = new Shortcuts();
         public int Rate;
         public bool LocalBreezeMigrated;
         public bool SortByReading, GroupByAuthor;
@@ -76,15 +83,18 @@ namespace Tingye
             var current = ReadSnapshot(Index);
             var backup = ReadSnapshot(Backup);
             var pending = PendingIndexes().Select(ReadSnapshot).Where(x => x != null).ToList();
-            var saved = current;
-            var newest = pending.FirstOrDefault(x => x.Books.Count > 0);
-            if (newest != null && (current == null || current.Books.Count == 0 || newest.Modified >= current.Modified))
-                saved = newest;
-            if (saved == null || (saved.Books.Count == 0 && backup != null && backup.Books.Count > 0))
-                saved = backup;
-
+            RecoverBookRemovals(current);
             var copies = Files(BooksDirectory, "*.epub")
                 .Where(path => BookId.IsMatch(Path.GetFileNameWithoutExtension(path))).ToArray();
+            var copyIds = new HashSet<string>(copies.Select(Path.GetFileNameWithoutExtension));
+            var saved = current;
+            var newest = pending.FirstOrDefault(x => x.Books.Any(item => copyIds.Contains(item.Id)));
+            if (newest != null && (current == null || current.Books.Count == 0 || newest.Modified >= current.Modified))
+                saved = newest;
+            if (saved == null || (saved.Books.Count == 0 && backup != null &&
+                backup.Books.Any(item => copyIds.Contains(item.Id))))
+                saved = backup;
+
             var entries = saved == null ? new List<ShelfEntry>() : new List<ShelfEntry>(saved.Books);
             var known = new HashSet<string>(entries.Select(item => item.Id));
             var missing = copies.Where(path => !known.Contains(Path.GetFileNameWithoutExtension(path))).ToArray();
@@ -131,6 +141,10 @@ namespace Tingye
             Theme = saved == null ? null : saved.Theme;
             ReadingFont = saved == null ? null : saved.ReadingFont;
             ReadingSize = saved == null ? 17 : saved.ReadingSize;
+            AutoHidePlayer = saved == null || saved.AutoHidePlayer;
+            AnimateBookOpening = saved == null || saved.AnimateBookOpening;
+            PlayerHideDelay = saved == null ? DefaultPlayerHideDelay : saved.PlayerHideDelay;
+            KeyboardShortcuts = saved == null ? new Shortcuts() : saved.Shortcuts;
             ReadFilter = saved == null ? ShelfReadFilter.All : saved.ReadFilter;
             bool rebuilt = Books.Count != (current == null ? 0 : current.Books.Count);
             trustedIndex = current != null && !rebuilt;
@@ -139,6 +153,72 @@ namespace Tingye
                 throw new InvalidDataException("没有找到可用的书架备份。原索引已保留。");
             writeBlocked = false;
             return saved != current || rebuilt || dated;
+        }
+
+        public bool RemoveBook(ShelfEntry item)
+        {
+            int position = Books.IndexOf(item);
+            if (position < 0 || !BookId.IsMatch(item.Id)) throw new InvalidOperationException("书架里找不到这本书。");
+            if (writeBlocked) throw new IOException("请重新打开听页，确认书架可读取后再删除。");
+
+            string path = BookPath(item.Id);
+            string staging = Path.Combine(directory, item.Id + RemovingSuffix);
+            bool staged = false;
+            try { File.Move(path, staging); staged = true; }
+            catch (FileNotFoundException) { }
+            catch (DirectoryNotFoundException) { }
+            string previousSelection = SelectedId;
+            Books.RemoveAt(position);
+            if (SelectedId == item.Id) SelectedId = null;
+            try { Save(); }
+            catch
+            {
+                Books.Insert(position, item);
+                SelectedId = previousSelection;
+                if (staged) File.Move(staging, path);
+                throw;
+            }
+
+            var cached = recentBooks.FirstOrDefault(book => book.Id == item.Id);
+            if (cached != null) recentBooks.Remove(cached);
+            return !staged || DeleteStagedBook(staging);
+        }
+
+        private void RecoverBookRemovals(Snapshot current)
+        {
+            var kept = current == null ? null : new HashSet<string>(current.Books.Select(item => item.Id));
+            foreach (string staging in Files(directory, "*" + RemovingSuffix))
+            {
+                string name = Path.GetFileName(staging);
+                if (!name.EndsWith(RemovingSuffix, StringComparison.Ordinal)) continue;
+                string id = name.Substring(0, name.Length - RemovingSuffix.Length);
+                if (!BookId.IsMatch(id)) continue;
+                if (kept != null && !kept.Contains(id))
+                {
+                    DeleteStagedBook(staging);
+                }
+                else
+                {
+                    // With a missing or unchanged primary index, keep the book recoverable.
+                    string path = BookPath(id);
+                    if (!File.Exists(path))
+                    {
+                        Directory.CreateDirectory(BooksDirectory);
+                        File.Move(staging, path);
+                    }
+                }
+            }
+        }
+
+        private static bool DeleteStagedBook(string path)
+        {
+            try
+            {
+                File.Delete(path);
+                return true;
+            }
+            catch (IOException) { return false; }
+            catch (UnauthorizedAccessException) { return false; }
         }
 
         public void Save()
@@ -151,6 +231,9 @@ namespace Tingye
                 new XAttribute("sort-by-reading", SortByReading), new XAttribute("group-by-author", GroupByAuthor),
                 new XAttribute("theme", Theme ?? "green"), new XAttribute("read-filter", (int)ReadFilter),
                 new XAttribute("reading-font", ReadingFont ?? "Microsoft YaHei"), new XAttribute("reading-size", ReadingSize),
+                new XAttribute("auto-hide-player", AutoHidePlayer), new XAttribute("player-hide-delay", PlayerHideDelay),
+                new XAttribute("animate-book-opening", AnimateBookOpening),
+                KeyboardShortcuts.Save(),
                 Books.Select(item => new XElement("book", new XAttribute("id", item.Id), new XAttribute("title", item.Title),
                     String.IsNullOrWhiteSpace(item.CustomTitle) ? null : new XAttribute("display-title", item.CustomTitle),
                     new XAttribute("author", item.Author ?? ""), new XAttribute("voice", item.Voice ?? ""),
@@ -226,6 +309,7 @@ namespace Tingye
             catch (XmlException) { return null; }
             if (root.Name != "shelf") return null;
 
+            int hideDelay = ReadInt(root, "player-hide-delay");
             var snapshot = new Snapshot {
                 Modified = File.GetLastWriteTimeUtc(path), SelectedId = (string)root.Attribute("selected"),
                 PreferredVoice = (string)root.Attribute("preferred-voice"),
@@ -234,6 +318,10 @@ namespace Tingye
                 GroupByAuthor = (string)root.Attribute("group-by-author") == "true",
                 Theme = (string)root.Attribute("theme"),
                 ReadingFont = (string)root.Attribute("reading-font"), ReadingSize = ReadInt(root, "reading-size"),
+                AutoHidePlayer = (string)root.Attribute("auto-hide-player") != "false",
+                AnimateBookOpening = (string)root.Attribute("animate-book-opening") != "false",
+                PlayerHideDelay = Array.IndexOf(PlayerHideDelays, hideDelay) >= 0 ? hideDelay : DefaultPlayerHideDelay,
+                Shortcuts = Shortcuts.Load(root.Element("shortcuts")),
                 ReadFilter = (ShelfReadFilter)ReadInt(root, "read-filter")
             };
             if (!Enum.IsDefined(typeof(ShelfReadFilter), snapshot.ReadFilter)) snapshot.ReadFilter = ShelfReadFilter.All;
@@ -263,6 +351,10 @@ namespace Tingye
             public string SelectedId, PreferredVoice, Theme;
             public string ReadingFont;
             public int ReadingSize;
+            public bool AutoHidePlayer;
+            public bool AnimateBookOpening;
+            public int PlayerHideDelay;
+            public Shortcuts Shortcuts;
             public int Rate;
             public bool LocalBreezeMigrated, SortByReading, GroupByAuthor;
             public ShelfReadFilter ReadFilter;

@@ -18,8 +18,25 @@ namespace Tingye
         public readonly List<Chapter> Chapters = new List<Chapter>();
         public readonly List<PassageRange> LegacyPositions = new List<PassageRange>();
         public readonly List<int> PreviousChapterStarts = new List<int>();
+        public readonly Dictionary<int, List<ReadingNote>> Notes = new Dictionary<int, List<ReadingNote>>();
+        public readonly Dictionary<int, string> SpeechOverrides = new Dictionary<int, string>();
         public int ChapterCount;
         public long CharacterCount;
+
+        public string SpeechAt(int chapter, int passage)
+        {
+            var section = Chapters[chapter];
+            string text;
+            return SpeechOverrides.TryGetValue(section.Start + passage, out text) ? text : section.Passages[passage];
+        }
+
+        public bool FindSpeechPassage(ref int chapter, ref int passage)
+        {
+            for (; chapter < Chapters.Count; chapter++, passage = 0)
+                for (; passage < Chapters[chapter].Passages.Count; passage++)
+                    if (SpeechAt(chapter, passage).Length != 0) return true;
+            return false;
+        }
 
         public void IndexChapterLengths()
         {
@@ -54,6 +71,18 @@ namespace Tingye
             chapter = Chapters.FindLastIndex(x => x.Start <= index);
             passage = Math.Min(index - Chapters[chapter].Start, Chapters[chapter].Passages.Count - 1);
         }
+    }
+
+    internal sealed class ReadingNote
+    {
+        public ReadingNote(string marker, string text)
+        {
+            Marker = marker;
+            Text = text;
+        }
+
+        public string Marker { get; private set; }
+        public string Text { get; private set; }
     }
 
     internal sealed class Chapter
@@ -97,6 +126,9 @@ namespace Tingye
         private const long BookLimit = 128L * 1024 * 1024;
         private static readonly Uri ArchiveRoot = new Uri("https://epub.invalid/");
         private static readonly Regex Space = new Regex(@"[\s\u200B]+", RegexOptions.Compiled);
+        private static readonly Regex NoteMarker = new Regex(
+            @"^(?:(?:注(?:释)?|註(?:釋)?|(?:foot|end)?note)\s*)?\p{N}*$|^[\[［(（【〔][\p{N}a-z\s]+[\]］)）】〕]$",
+            RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
         private static readonly Regex Entity = new Regex(@"&[a-zA-Z][a-zA-Z0-9]+;", RegexOptions.Compiled);
         private static readonly Regex HtmlEnd = new Regex(@"</html\s*>",
             RegexOptions.IgnoreCase | RegexOptions.CultureInvariant | RegexOptions.RightToLeft);
@@ -112,6 +144,8 @@ namespace Tingye
             "audio canvas iframe math nav noscript rp rt script style svg template video".Split(' '));
 
         private readonly ZipArchive archive;
+        private readonly Dictionary<string, NoteDocument> noteDocuments = new Dictionary<string, NoteDocument>(StringComparer.Ordinal);
+        private readonly Dictionary<string, NoteSource> noteSources = new Dictionary<string, NoteSource>(StringComparer.Ordinal);
         private long bytesRead;
 
         private Epub(ZipArchive archive) { this.archive = archive; }
@@ -172,6 +206,8 @@ namespace Tingye
                 foreach (var reference in guide.Elements().Where(x => HasToken(x, "type", "toc")))
                     contentsPages.Add(Resolve(packagePath, Attr(reference, "href")));
             var encrypted = ReadEncryptedPaths();
+            var textPaths = new HashSet<string>(items.Where(x => Attr(x, "media-type") == "application/xhtml+xml" ||
+                Attr(x, "media-type") == "text/html").Select(x => Resolve(packagePath, Attr(x, "href"))), StringComparer.Ordinal);
             var book = new Book {
                 Title = Clean(Value(Child(metadata, "title"))),
                 Author = Clean(Value(Child(metadata, "creator"))),
@@ -198,7 +234,7 @@ namespace Tingye
                         if (encrypted.Contains(path)) throw new InvalidDataException("这本书的正文受到 DRM 加密保护。");
                         List<TocEntry> entries;
                         directory.TryGetValue(path, out entries);
-                        try { ReadSegments(segments, path, entries, contentsPages.Contains(path)); }
+                        try { ReadSegments(segments, path, entries, contentsPages.Contains(path), encrypted, textPaths); }
                         catch (XmlException) { unreadable++; }
                         catch (FileNotFoundException) { unreadable++; }
                         break;
@@ -210,19 +246,28 @@ namespace Tingye
             if (segments.Count == 0) throw new InvalidDataException("没有找到可朗读的正文。这本书可能只有图片，或正文文件已损坏。");
             if (unreadable > 0) throw new InvalidDataException("有 " + unreadable + " 个正文文件缺失或格式损坏，无法完整导入。");
             GroupChapters(book, segments);
+            foreach (var source in noteSources.Values) source.SkipDefinitions(book);
             return book;
         }
 
-        private void ReadSegments(List<SpineSegment> segments, string path, List<TocEntry> entries, bool contentsPage)
+        private void ReadSegments(List<SpineSegment> segments, string path, List<TocEntry> entries, bool contentsPage,
+            HashSet<string> encrypted, HashSet<string> textPaths)
         {
-            var document = ReadXml(path, allowTrailingImages: true);
+            NoteDocument noteDocument;
+            if (!noteDocuments.TryGetValue(path, out noteDocument) || noteDocument == null)
+                noteDocument = new NoteDocument(ReadXml(path, allowTrailingImages: true));
+            noteDocuments.Remove(path);
+            var document = noteDocument.Document;
             var body = Find(document, "body");
             if (body == null) return;
             entries = entries ?? new List<TocEntry>();
-            var flow = new TextFlow(entries.Select(x => x.Anchor));
+            var flow = new TextFlow(entries.Select(x => x.Anchor),
+                link => ReadNote(link, path, noteDocument, encrypted, textPaths));
             flow.Visit(body);
             flow.Flush();
             if (flow.Passages.Count == 0) return;
+            var noteSource = GetNoteSource(path);
+            noteSource.IndexRanges(noteDocument.Anchors.Value, flow.BlockRanges);
 
             var links = new SortedDictionary<int, TocEntry>();
             foreach (var entry in entries)
@@ -243,6 +288,7 @@ namespace Tingye
             if (!links.ContainsKey(0)) links.Add(0, null);
 
             var offsets = links.Keys.ToList();
+            int firstSegment = segments.Count;
             int headingIndex = 0;
             for (int index = 0; index < offsets.Count; index++)
             {
@@ -251,7 +297,8 @@ namespace Tingye
                 var link = links[start];
                 var segment = new SpineSegment {
                     Toc = link, Title = link == null ? fallback : link.Title, DocumentTitle = documentTitle,
-                    Passages = flow.Passages.GetRange(start, end - start), IsContents = contentsPage
+                    Passages = flow.Passages.GetRange(start, end - start), IsContents = contentsPage,
+                    NoteSource = index == 0 ? noteSource : null
                 };
                 while (headingIndex < flow.Headings.Count && flow.Headings[headingIndex].Passage < end)
                 {
@@ -261,6 +308,136 @@ namespace Tingye
                 }
                 segments.Add(segment);
             }
+            // Store note positions relative to each segment before the TOC groups or splits them.
+            int segmentIndex = 0;
+            foreach (var note in flow.Notes.OrderBy(x => x.Key))
+            {
+                while (segmentIndex + 1 < offsets.Count && note.Key >= offsets[segmentIndex + 1]) segmentIndex++;
+                segments[firstSegment + segmentIndex].Notes.Add(note.Key - offsets[segmentIndex], note.Value);
+            }
+            segmentIndex = 0;
+            foreach (var speech in flow.SpeechOverrides.OrderBy(x => x.Key))
+            {
+                while (segmentIndex + 1 < offsets.Count && speech.Key >= offsets[segmentIndex + 1]) segmentIndex++;
+                segments[firstSegment + segmentIndex].SpeechOverrides.Add(speech.Key - offsets[segmentIndex], speech.Value);
+            }
+        }
+
+        private static ILookup<string, XElement> IndexNoteAnchors(XDocument document)
+        {
+            return document.Descendants().Select(element => new { Element = element, Anchor = Anchor(element) })
+                .Where(x => x.Anchor.Length != 0).ToLookup(x => x.Anchor, x => x.Element, StringComparer.Ordinal);
+        }
+
+        private ReadingNote ReadNote(XElement link, string source, NoteDocument local,
+            HashSet<string> encrypted, HashSet<string> textPaths)
+        {
+            string href = Attr(link, "href");
+            int hash = href.IndexOf('#');
+            if (hash < 0 || hash == href.Length - 1 || link.Ancestors().Any(IsNoteBlock) || IsBacklink(link)) return null;
+            bool explicitReference = HasToken(link, "type", "noteref") || HasToken(link, "role", "doc-noteref") ||
+                HasToken(link, "class", "duokan-footnote") || HasToken(link, "class", "noteref");
+            string label = Clean(link.Value);
+            string path = Resolve(source, href);
+            if (path == null || !textPaths.Contains(path) || encrypted.Contains(path)) return null;
+            string id = Uri.UnescapeDataString(href.Substring(hash + 1));
+
+            ILookup<string, XElement> anchors;
+            if (path == source) anchors = local.Anchors.Value;
+            else
+            {
+                // Cross-file references may point to a document outside the reading order.
+                if (!explicitReference && !id.StartsWith("note", StringComparison.OrdinalIgnoreCase) &&
+                    !id.StartsWith("fn", StringComparison.OrdinalIgnoreCase) &&
+                    !(label.Length > 2 && label.Length <= 12 && label[0] == '[' && label[label.Length - 1] == ']') &&
+                    !link.Ancestors().TakeWhile(x => !Blocks.Contains(x.Name.LocalName))
+                    .Any(x => x.Name.LocalName == "sup" || HasToken(x, "class", "note"))) return null;
+                NoteDocument document;
+                if (!noteDocuments.TryGetValue(path, out document))
+                {
+                    try { document = new NoteDocument(ReadXml(path, allowTrailingImages: true)); }
+                    catch (XmlException) { document = null; }
+                    catch (FileNotFoundException) { document = null; }
+                    catch (InvalidDataException) { document = null; }
+                    catch (DecoderFallbackException) { document = null; }
+                    noteDocuments[path] = document;
+                }
+                if (document == null) return null;
+                anchors = document.Anchors.Value;
+            }
+
+            var target = anchors[id].FirstOrDefault();
+            var block = FindNoteBlock(target, explicitReference);
+            string noteText = "";
+            if (block != null && !link.AncestorsAndSelf().Contains(block))
+            {
+                string referenceId = Anchor(link);
+                var flow = new TextFlow(Enumerable.Empty<string>(), skipLink: candidate => {
+                    if (IsBacklink(candidate)) return true;
+                    string backlink = Attr(candidate, "href");
+                    int marker = backlink.IndexOf('#');
+                    return referenceId.Length > 0 && marker >= 0 && Resolve(path, backlink) == source &&
+                        Uri.UnescapeDataString(backlink.Substring(marker + 1)) == referenceId;
+                });
+                flow.Visit(block, includeHiddenRoot: true);
+                flow.Flush();
+                noteText = String.Join("\n", flow.Passages);
+                if (noteText.Length != 0 && (IsNoteBlock(block) || IsStandaloneNote(block)))
+                    GetNoteSource(path).ReferencedIds.Add(id);
+            }
+            if (noteText.Length == 0 && explicitReference)
+            {
+                var image = link.Descendants().FirstOrDefault(x => x.Name.LocalName == "img");
+                noteText = Clean(Attr(image, "zy-footnote"));
+                if (noteText.Length == 0) noteText = Clean(Attr(image, "alt"));
+            }
+            if (noteText.Length == 0) return null;
+            return new ReadingNote(label.Length > 0 && label.Length <= 20 ? label : "注", noteText);
+        }
+
+        private static bool IsBacklink(XElement link)
+        {
+            return HasToken(link, "role", "doc-backlink") || HasToken(link, "type", "backlink");
+        }
+
+        private NoteSource GetNoteSource(string path)
+        {
+            NoteSource source;
+            if (!noteSources.TryGetValue(path, out source)) noteSources.Add(path, source = new NoteSource());
+            return source;
+        }
+
+        private static XElement FindNoteBlock(XElement target, bool allowUnmarked)
+        {
+            if (target == null) return null;
+            var ancestors = target.AncestorsAndSelf();
+            return ancestors.FirstOrDefault(IsNoteBlock) ?? (allowUnmarked
+                ? ancestors.FirstOrDefault(x => Blocks.Contains(x.Name.LocalName) && x.Name.LocalName != "main")
+                : null);
+        }
+
+        private static bool IsStandaloneNote(XElement element)
+        {
+            string name = element.Name.LocalName;
+            return name == "p" || name == "li" || name == "dd" || name == "aside" ||
+                (name == "div" && !element.Descendants().Any(x => Blocks.Contains(x.Name.LocalName)));
+        }
+
+        private static bool IsNoteBlock(XElement element)
+        {
+            if (!Blocks.Contains(element.Name.LocalName)) return false;
+            return HasToken(element, "type", "footnote") || HasToken(element, "type", "endnote") ||
+                HasToken(element, "type", "rearnote") || HasToken(element, "type", "annotation") ||
+                HasToken(element, "role", "doc-footnote") || HasToken(element, "role", "doc-endnote") ||
+                HasToken(element, "class", "footnote") || HasToken(element, "class", "endnote") ||
+                HasToken(element, "class", "note") || HasToken(element, "class", "fnote") ||
+                HasToken(element, "class", "duokan-footnote-item");
+        }
+
+        private static string Anchor(XElement element)
+        {
+            string id = Attr(element, "id");
+            return id.Length == 0 && element.Name.LocalName == "a" ? Attr(element, "name") : id;
         }
 
         private static void GroupChapters(Book book, List<SpineSegment> segments)
@@ -303,6 +480,9 @@ namespace Tingye
                 bool omit = skipContents && segment.IsContents;
                 book.LegacyPositions.Add(new PassageRange(offset, omit ? 0 : segment.Passages.Count));
                 if (omit) continue;
+                if (segment.NoteSource != null) segment.NoteSource.BookStart = offset;
+                foreach (var note in segment.Notes) book.Notes.Add(offset + note.Key, note.Value);
+                foreach (var speech in segment.SpeechOverrides) book.SpeechOverrides.Add(offset + speech.Key, speech.Value);
 
                 var link = segment.Toc;
                 // Save the start positions from the previous layout, which used one chapter depth per book.
@@ -611,12 +791,56 @@ namespace Tingye
             public bool IsNumberedChapter, HasNumberedAncestor;
         }
 
+        private sealed class NoteDocument
+        {
+            public readonly XDocument Document;
+            public readonly Lazy<ILookup<string, XElement>> Anchors;
+
+            public NoteDocument(XDocument document)
+            {
+                Document = document;
+                Anchors = new Lazy<ILookup<string, XElement>>(() => IndexNoteAnchors(document));
+            }
+        }
+
+        private sealed class NoteSource
+        {
+            public readonly HashSet<string> ReferencedIds = new HashSet<string>(StringComparer.Ordinal);
+            private readonly Dictionary<string, PassageRange> ranges = new Dictionary<string, PassageRange>(StringComparer.Ordinal);
+            public int BookStart = -1;
+
+            public void IndexRanges(ILookup<string, XElement> anchors, Dictionary<XElement, PassageRange> blocks)
+            {
+                foreach (var anchor in anchors)
+                {
+                    var block = FindNoteBlock(anchor.First(), true);
+                    PassageRange range;
+                    if (block != null && blocks.TryGetValue(block, out range)) ranges.Add(anchor.Key, range);
+                }
+            }
+
+            public void SkipDefinitions(Book book)
+            {
+                if (BookStart < 0) return;
+                foreach (string id in ReferencedIds)
+                {
+                    PassageRange range;
+                    if (!ranges.TryGetValue(id, out range)) continue;
+                    for (int passage = BookStart + range.Start; passage < BookStart + range.Start + range.Length; passage++)
+                        book.SpeechOverrides[passage] = "";
+                }
+            }
+        }
+
         private sealed class SpineSegment
         {
             public string Title, DocumentTitle;
             public TocEntry Toc;
             public bool IsContents;
             public List<string> Passages;
+            public NoteSource NoteSource;
+            public readonly Dictionary<int, List<ReadingNote>> Notes = new Dictionary<int, List<ReadingNote>>();
+            public readonly Dictionary<int, string> SpeechOverrides = new Dictionary<int, string>();
             public readonly List<BodyHeading> Headings = new List<BodyHeading>();
         }
 
@@ -631,41 +855,90 @@ namespace Tingye
             private const int PassageLength = 400;
             private readonly StringBuilder text = new StringBuilder();
             private readonly HashSet<string> targets;
+            private readonly Func<XElement, ReadingNote> readNote;
+            private readonly Func<XElement, bool> skipLink;
+            private readonly List<KeyValuePair<int, ReadingNote>> pendingNotes = new List<KeyValuePair<int, ReadingNote>>();
+            private readonly List<PassageRange> omittedText = new List<PassageRange>();
             public readonly List<string> Passages = new List<string>();
             public readonly Dictionary<string, int> Anchors = new Dictionary<string, int>();
             public readonly List<BodyHeading> Headings = new List<BodyHeading>();
+            public readonly Dictionary<int, List<ReadingNote>> Notes = new Dictionary<int, List<ReadingNote>>();
+            public readonly Dictionary<int, string> SpeechOverrides = new Dictionary<int, string>();
+            public readonly Dictionary<XElement, PassageRange> BlockRanges = new Dictionary<XElement, PassageRange>();
 
-            public TextFlow(IEnumerable<string> anchors) { targets = new HashSet<string>(anchors.Where(x => x.Length > 0)); }
+            public TextFlow(IEnumerable<string> anchors, Func<XElement, ReadingNote> readNote = null,
+                Func<XElement, bool> skipLink = null)
+            {
+                targets = new HashSet<string>(anchors.Where(x => x.Length > 0));
+                this.readNote = readNote;
+                this.skipLink = skipLink;
+            }
 
-            public void Visit(XNode node, int depth = 0)
+            public void Visit(XNode node, int depth = 0, bool includeHiddenRoot = false, bool omitFromSpeech = false)
             {
                 if (depth > 200) throw new InvalidDataException("正文的嵌套层级过深。");
                 var plain = node as XText;
-                if (plain != null) { text.Append(plain.Value); return; }
+                if (plain != null)
+                {
+                    if (omitFromSpeech && plain.Value.Length != 0)
+                        omittedText.Add(new PassageRange(text.Length, plain.Value.Length));
+                    text.Append(plain.Value);
+                    return;
+                }
                 var element = node as XElement;
                 if (element == null) return;
                 string name = element.Name.LocalName.ToLowerInvariant();
-                if (Hidden.Contains(name) || (element.HasAttributes && element.Attributes().Any(x => x.Name.LocalName == "hidden")) ||
-                    String.Equals(Attr(element, "aria-hidden"), "true", StringComparison.OrdinalIgnoreCase)) return;
+                if (Hidden.Contains(name) || (!includeHiddenRoot &&
+                    ((element.HasAttributes && element.Attributes().Any(x => x.Name.LocalName == "hidden")) ||
+                    String.Equals(Attr(element, "aria-hidden"), "true", StringComparison.OrdinalIgnoreCase)))) return;
 
                 bool block = Blocks.Contains(name) || name == "br";
-                string anchor = Attr(element, "id");
-                if (anchor.Length == 0 && name == "a") anchor = Attr(element, "name");
+                string anchor = Anchor(element);
                 bool isTarget = anchor.Length > 0 && targets.Contains(anchor);
                 if (block || isTarget) Flush();
                 if (isTarget && !Anchors.ContainsKey(anchor)) Anchors.Add(anchor, Passages.Count);
+                if (name == "a")
+                {
+                    if (skipLink != null && skipLink(element)) return;
+                    var note = readNote == null ? null : readNote(element);
+                    if (note != null)
+                    {
+                        pendingNotes.Add(new KeyValuePair<int, ReadingNote>(text.Length, note));
+                        string label = Clean(element.Value);
+                        omitFromSpeech = omitFromSpeech || (label.Length > 0 &&
+                            (NoteMarker.IsMatch(label) || !SpeechText.IsSpeakable(label)));
+                    }
+                }
                 int start = Passages.Count;
-                for (var child = element.FirstNode; child != null; child = child.NextNode) Visit(child, depth + 1);
+                for (var child = element.FirstNode; child != null; child = child.NextNode)
+                    Visit(child, depth + 1, omitFromSpeech: omitFromSpeech);
                 if (block) Flush();
+                if (block && readNote != null && Passages.Count > start)
+                    BlockRanges.Add(element, new PassageRange(start, Passages.Count - start));
                 if (Passages.Count > start && name.Length == 2 && name[0] == 'h' && name[1] >= '1' && name[1] <= '6')
                     Headings.Add(new BodyHeading { Passage = start, Level = name[1] - '0', Title = Clean(element.Value) });
             }
 
             public void Flush()
             {
-                if (text.Length == 0) return;
-                string paragraph = Clean(text.ToString());
+                if (text.Length == 0 && pendingNotes.Count == 0) return;
+                string raw = text.ToString();
+                string paragraph = Clean(raw);
                 text.Clear();
+                int noteIndex = 0;
+                var noteOffsets = pendingNotes.Count == 0 ? null : new NormalizedOffsets(raw, paragraph.Length);
+                if (omittedText.Count > 0)
+                {
+                    var speechOffsets = new NormalizedOffsets(raw, paragraph.Length);
+                    for (int i = 0; i < omittedText.Count; i++)
+                    {
+                        var range = omittedText[i];
+                        int from = speechOffsets.Map(range.Start);
+                        int to = speechOffsets.Map(range.Start + range.Length);
+                        omittedText[i] = new PassageRange(from, to - from);
+                    }
+                }
+                int omission = 0;
                 int start = 0;
                 while (start < paragraph.Length)
                 {
@@ -678,9 +951,84 @@ namespace Tingye
                         if (Char.IsHighSurrogate(paragraph[end - 1])) end--;
                     }
                     string passage = paragraph.Substring(start, end - start).Trim();
-                    if (passage.Length > 0) Passages.Add(passage);
+                    if (passage.Length > 0)
+                    {
+                        while (noteIndex < pendingNotes.Count)
+                        {
+                            var note = pendingNotes[noteIndex];
+                            int position = noteOffsets.Map(note.Key);
+                            if (position >= end && end < paragraph.Length) break;
+                            AddNote(Passages.Count, note.Value);
+                            noteIndex++;
+                        }
+                        StoreSpeechOverride(paragraph, start, end, ref omission);
+                        Passages.Add(passage);
+                    }
                     start = end;
                 }
+                // Some EPUBs put an image-only reference immediately after the text block.
+                if (Passages.Count > 0)
+                    while (noteIndex < pendingNotes.Count) AddNote(Passages.Count - 1, pendingNotes[noteIndex++].Value);
+                pendingNotes.Clear();
+                omittedText.Clear();
+            }
+
+            private void StoreSpeechOverride(string paragraph, int start, int end, ref int omission)
+            {
+                StringBuilder spoken = null;
+                int copied = start;
+                while (omission < omittedText.Count && omittedText[omission].Start < end)
+                {
+                    var range = omittedText[omission];
+                    if (range.Start + range.Length > copied)
+                    {
+                        if (spoken == null) spoken = new StringBuilder(end - start);
+                        int from = Math.Max(copied, range.Start);
+                        spoken.Append(paragraph, copied, from - copied);
+                        copied = Math.Min(end, range.Start + range.Length);
+                        if (from < copied && (paragraph[from] == ' ' || paragraph[copied - 1] == ' ')) spoken.Append(' ');
+                    }
+                    if (range.Start + range.Length > end) break;
+                    omission++;
+                }
+                if (spoken == null) return;
+                spoken.Append(paragraph, copied, end - copied);
+                string speech = Clean(spoken.ToString());
+                if (speech != paragraph.Substring(start, end - start).Trim())
+                    SpeechOverrides.Add(Passages.Count, SpeechText.IsSpeakable(speech) ? speech : "");
+            }
+
+            private void AddNote(int passage, ReadingNote note)
+            {
+                List<ReadingNote> notes;
+                if (!Notes.TryGetValue(passage, out notes)) Notes.Add(passage, notes = new List<ReadingNote>());
+                if (!notes.Any(x => x.Marker == note.Marker && x.Text == note.Text)) notes.Add(note);
+            }
+        }
+
+        // Match the display text's whitespace normalization without changing its split points.
+        private sealed class NormalizedOffsets
+        {
+            private Match spaces;
+            private int removed;
+            private readonly int length;
+
+            public NormalizedOffsets(string raw, int length)
+            {
+                spaces = Space.Match(raw);
+                removed = spaces.Success && spaces.Index == 0 ? 1 : 0;
+                this.length = length;
+            }
+
+            public int Map(int offset)
+            {
+                while (spaces.Success && spaces.Index + spaces.Length <= offset)
+                {
+                    removed += spaces.Length - 1;
+                    spaces = spaces.NextMatch();
+                }
+                if (spaces.Success && spaces.Index < offset) offset = spaces.Index + 1;
+                return Math.Max(0, Math.Min(length, offset - removed));
             }
         }
     }

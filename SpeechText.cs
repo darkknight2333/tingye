@@ -129,7 +129,7 @@ namespace Tingye
             return !Abbreviation.IsMatch(text.Substring(Math.Max(0, index - 5), Math.Min(index + 1, 6)));
         }
 
-        private static bool IsSpeakable(string text)
+        public static bool IsSpeakable(string text)
         {
             for (int i = 0; i < text.Length; i++)
                 if (Char.IsLetterOrDigit(text, i)) return true;

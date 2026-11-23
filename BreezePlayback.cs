@@ -4,6 +4,7 @@ using System.Diagnostics;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
+using System.Windows.Threading;
 
 namespace Tingye
 {
@@ -39,10 +40,23 @@ namespace Tingye
             var token = current.Token;
             var audio = output = new PcmPlayback();
             audio.Pause();
-            audio.Drained += Notify;
             var queued = new Queue<QueuedClip>();
             long readyBytes = 0;
             long primeMs = MinimumPrimeMs;
+            bool streamLocal = voiceChoice == NeuralVoice.BreezeLocal;
+            var dispatcher = Dispatcher.CurrentDispatcher;
+            int streamLeadMs = 900;
+            audio.Drained += delegate {
+                if (sequence != current) return;
+                if (streamLocal && generating && primed)
+                {
+                    audio.Pause();
+                    primed = false;
+                    readyBytes = 0;
+                    streamLeadMs = Math.Min(3000, streamLeadMs + 700);
+                }
+                Notify();
+            };
             Exception error = null;
             try
             {
@@ -52,10 +66,12 @@ namespace Tingye
                 for (; chapter < book.Chapters.Count; chapter++, passage = 0)
                 {
                     var paragraphs = book.Chapters[chapter].Passages;
-                    for (; passage < paragraphs.Count; passage++, paragraphNumber++)
+                    for (; passage < paragraphs.Count; passage++)
                     {
-                        bool quickStart = voiceChoice == NeuralVoice.BreezeLocal && !primed;
-                        var pieces = SpeechText.Split(paragraphs[passage], !useLocal, quickStart);
+                        token.ThrowIfCancellationRequested();
+                        bool quickStart = streamLocal && paragraphNumber == 0;
+                        var pieces = SpeechText.Split(book.SpeechAt(chapter, passage), !useLocal, quickStart);
+                        if (pieces.Count == 0) continue;
                         int currentChapter = chapter, currentPassage = passage;
                         for (int i = 0; i < pieces.Count; i++)
                         {
@@ -73,15 +89,46 @@ namespace Tingye
                             generating = true;
                             Notify();
                             bool paragraphEnd = i + 1 == pieces.Count;
+                            Action started = i == 0 ? (Action)(() => {
+                                if (PassageStarted != null) PassageStarted(currentChapter, currentPassage);
+                            }) : null;
+                            if (streamLocal)
+                            {
+                                Task lastPlayed = null;
+                                Action<byte[]> submit = block => {
+                                    token.ThrowIfCancellationRequested();
+                                    lastPlayed = audio.Enqueue(block, started);
+                                    started = null;
+                                    if (!primed)
+                                    {
+                                        readyBytes += block.Length;
+                                        if (readyBytes >= streamLeadMs * (BreezeVoice.SampleRate * 2 / 1000)) Prime();
+                                    }
+                                    Notify();
+                                };
+                                try
+                                {
+                                    var cached = await voice.SynthesizeAsync(pieces[i], paragraphEnd, rate, token, true,
+                                        block => dispatcher.InvokeAsync(() => submit(block), DispatcherPriority.Normal, token).Task);
+                                    token.ThrowIfCancellationRequested();
+                                    if (cached != null) submit(cached);
+                                    generating = false;
+                                    // A complete short clip can play immediately even below the streaming threshold.
+                                    if (lastPlayed != null) Prime();
+                                    Notify();
+                                }
+                                finally
+                                {
+                                    if (lastPlayed != null) queued.Enqueue(new QueuedClip(paragraphNumber, lastPlayed));
+                                }
+                                continue;
+                            }
                             long startedAt = Stopwatch.GetTimestamp();
                             byte[] clip = voiceChoice == NeuralVoice.QwenVivian || voiceChoice == NeuralVoice.QwenSerena
                                 ? await voice.SynthesizeQwenAsync(pieces[i], paragraphEnd, rate, token, voiceChoice)
                                 : await voice.SynthesizeAsync(pieces[i], paragraphEnd, rate, token, useLocal);
                             token.ThrowIfCancellationRequested();
                             generating = false;
-                            Action started = i == 0 ? (Action)(() => {
-                                if (PassageStarted != null) PassageStarted(currentChapter, currentPassage);
-                            }) : null;
                             queued.Enqueue(new QueuedClip(paragraphNumber, audio.Enqueue(clip, started)));
                             if (!primed)
                             {
@@ -92,11 +139,12 @@ namespace Tingye
                                     primeMs = Math.Max(primeMs, Math.Min(MaximumPrimeMs, synthesisMs * 3 / 2));
                                 }
                                 int clipLimit = useLocal ? LocalPrimeClipLimit : 2;
-                                if (quickStart || queued.Count >= clipLimit || readyBytes * 1000 >= primeMs * BreezeVoice.SampleRate * 2)
+                                if (queued.Count >= clipLimit || readyBytes * 1000 >= primeMs * BreezeVoice.SampleRate * 2)
                                     Prime();
                             }
                             Notify();
                         }
+                        paragraphNumber++;
                     }
                 }
             }
